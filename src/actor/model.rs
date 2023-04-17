@@ -33,6 +33,7 @@ where
     pub properties: Vec<Property<ActorModel<A, C, H>>>,
     pub record_msg_in: fn(cfg: &C, history: &H, envelope: Envelope<&A::Msg>) -> Option<H>,
     pub record_msg_out: fn(cfg: &C, history: &H, envelope: Envelope<&A::Msg>) -> Option<H>,
+    pub record_action: fn(cfg: &C, history: &H, state: &ActorModelState<A, H>, action: ActorModelAction<A::Msg, A::Timer>) -> Option<H>,
     pub within_boundary: fn(cfg: &C, state: &ActorModelState<A, H>) -> bool,
 }
 
@@ -88,6 +89,7 @@ where
             properties: Default::default(),
             record_msg_in: |_, _, _| None,
             record_msg_out: |_, _, _| None,
+            record_action: |_, _, _, _| None,
             within_boundary: |_, _| true,
         }
     }
@@ -151,6 +153,16 @@ where
         record_msg_out: fn(cfg: &C, history: &H, Envelope<&A::Msg>) -> Option<H>,
     ) -> Self {
         self.record_msg_out = record_msg_out;
+        self
+    }
+
+    /// Defines whether/how an action contributes to relevant history. Returning
+    /// `Some(new_history)` updates the relevant history, while `None` does not.
+    pub fn record_action(
+        mut self,
+        record_action: fn(cfg: &C, history: &H, state: &ActorModelState<A, H>, action: ActorModelAction<A::Msg, A::Timer>) -> Option<H>,
+    ) -> Self {
+        self.record_action = record_action;
         self
     }
 
@@ -264,6 +276,8 @@ where
         last_sys_state: &Self::State,
         action: Self::Action,
     ) -> Option<Self::State> {
+        let action_history = (self.record_action)(&self.cfg, &self.init_history, last_sys_state, action.clone());
+
         match action {
             ActorModelAction::Drop(env) => {
                 let mut next_state = last_sys_state.clone();
@@ -316,6 +330,9 @@ where
                 if let Some(history) = history {
                     next_sys_state.history = history;
                 }
+                if let Some(history) = action_history {
+                    next_sys_state.history = history;
+                }
                 self.process_commands(id, out, &mut next_sys_state);
                 Some(next_sys_state)
             }
@@ -336,6 +353,10 @@ where
                 if let Cow::Owned(next_actor_state) = state {
                     next_sys_state.actor_states[index] = Arc::new(next_actor_state);
                 }
+                if let Some(history) = action_history {
+                    next_sys_state.history = history;
+                }
+
                 self.process_commands(id, out, &mut next_sys_state);
                 Some(next_sys_state)
             }
