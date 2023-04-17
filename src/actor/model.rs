@@ -1168,3 +1168,160 @@ mod choice_test {
         );
     }
 }
+
+#[cfg(test)]
+mod history_test {
+    // Correct protocol:
+
+    // !timed_out  msg   !timed_out ◄┐ msg
+    // !done      ─────►  done     ──┘
+    //     │
+    //     │t.o.
+    //     ▼
+    //  timed_out  msg    timed_out ◄┐ msg
+    // !done      ─────►  done     ──┘
+
+
+    // Buggy implementation allows this:
+
+    // !timed_out  msg   !timed_out ◄┐ msg
+    // !done      ─────►  done     ──┘
+    //     │                 │
+    //     │t.o.             │t.o.
+    //     ▼                 ▼
+    //  timed_out  msg    timed_out ◄┐ msg
+    // !done      ─────►  done     ──┘
+
+    use crate::util::HashableHashMap;
+    use crate::checker::Checker;
+    use super::*;
+
+    #[derive(Clone)]
+    pub struct BugCfg {
+        has_bug: bool,
+    }
+
+    impl BugCfg {
+        pub fn into_model(self) -> ActorModel<MyActor, (), History> {
+            ActorModel::new((), History::default())
+                .actor(MyActor { reply_to: Id(1), cfg: self.clone() })
+                .actor(MyActor { reply_to: Id(0), cfg: self })
+                .record_action(|_, h, ams, ama| {
+                    Some(h.insert(ams, ama))
+                })
+                .property(Expectation::Always, "unused", |_, _| true)
+                .property(Expectation::Always, "once done is true, it remains true", |_, ams| {
+                    !ams.history.events.iter().any(|(id, (state, _))| {
+                        state.done && !ams.actor_states[*id].done
+                    })
+                })
+                .property(Expectation::Always, "once timed out is true, it remains true", |_, ams| {
+                    !ams.history.events.iter().any(|(id, (state, _))| {
+                        state.timed_out && !ams.actor_states[*id].timed_out
+                    })
+                })
+                .property(Expectation::Always, "if done is true, timed_out can't become true", |_, ams| {
+                    !ams.history.events.iter().any(|(id, (state, _))| {
+                        state.done && !state.timed_out && ams.actor_states[*id].timed_out
+                    })
+                })
+                .property(Expectation::Eventually, "all actors are done or timed out", |_, ams| {
+                    ams.actor_states.iter().all(|state| state.done || state.timed_out)
+                })
+        }
+    }
+
+    pub struct MyActor {
+        reply_to: Id,
+        cfg: BugCfg,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Hash)]
+    pub struct MyState {
+        pub done: bool,
+        pub timed_out: bool,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Hash)]
+    pub struct MyMsg;
+
+    #[derive(Clone, Debug, Eq, PartialEq, Hash)]
+    pub struct MyTimeout;
+
+
+    impl Actor for MyActor {
+        type Msg = MyMsg;
+        type Timer = MyTimeout;
+        type State = MyState;
+
+        fn on_start(&self, _id: Id, o: &mut Out<Self>) -> Self::State {
+            o.send(self.reply_to, MyMsg);
+            o.set_timer(MyTimeout, Duration::from_millis(0)..Duration::from_millis(100));
+            MyState { done: false, timed_out: false }
+        }
+
+        fn on_msg(&self, _id: Id, state: &mut Cow<Self::State>, _src: Id, _msg: Self::Msg, o: &mut Out<Self>) {
+            if !self.cfg.has_bug {
+                o.cancel_timer(MyTimeout);
+            }
+            state.to_mut().done = true;
+        }
+
+        fn on_timeout(&self, _id: Id, state: &mut Cow<Self::State>, _timer: &Self::Timer, _o: &mut Out<Self>) {
+            state.to_mut().timed_out = true;
+        }
+    }
+
+    #[derive(Clone, Debug, Hash, PartialEq)]
+    pub struct History {
+        pub events: HashableHashMap<usize, (<MyActor as Actor>::State, ActorModelAction<<MyActor as Actor>::Msg, <MyActor as Actor>::Timer>)>,
+    }
+
+    impl History {
+        pub fn insert(&self, ams: &ActorModelState<MyActor, History>, ama: ActorModelAction<<MyActor as Actor>::Msg, <MyActor as Actor>::Timer>) -> Self {
+            match ama {
+                ActorModelAction::Deliver { dst, .. } => {
+                    let mut events = self.events.clone();
+                    events.insert(usize::from(dst), ((*ams.actor_states[usize::from(dst)]).clone(), ama));
+                    History { events }
+                }
+                ActorModelAction::Drop(_) => unreachable!(),
+                ActorModelAction::Timeout(id, _) => {
+                    let mut events = self.events.clone();
+                    events.insert(usize::from(id), ((*ams.actor_states[usize::from(id)]).clone(), ama));
+                    History { events }
+                }
+            }
+        }
+    }
+
+    impl Default for History {
+        fn default() -> Self {
+            History { events: Default::default() }
+        }
+    }
+
+    #[test]
+    fn test_history() {
+        BugCfg { has_bug: false }
+            .into_model()
+            .checker()
+            .spawn_bfs()
+            .join()
+            .assert_properties();
+
+        BugCfg { has_bug: true }
+            .into_model()
+            .checker()
+            .spawn_bfs()
+            .join()
+            .assert_discovery("if done is true, timed_out can't become true", vec![
+                ActorModelAction::Deliver {
+                    src: Id(0),
+                    dst: Id(1),
+                    msg: MyMsg,
+                },
+                ActorModelAction::Timeout(Id(1), MyTimeout)
+            ]);
+    }
+}
